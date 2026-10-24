@@ -59,15 +59,21 @@ def apply_scenario(base_forecast, delay_days=0, delay_impact=0, extra_expense=0,
     return scenario_forecast
 
 # --- 3. РУЧНОЙ ВВОД СОБЫТИЙ ---
-def inject_expected_events(base_forecast, forecast_dates, events_list):
+def inject_expected_events(base_forecast, forecast_dates, events_list, tenant_id=None):
     """
     Добавляет ручные события и данные из 1С/Банка в базовый прогноз.
+    Отфильтровывает события, не относящиеся к указанному tenant_id.
     """
     if not events_list:
         return base_forecast
         
     adjusted_forecast = list(base_forecast)
+    
     for event in events_list:
+        # Multi-tenancy check: пропускаем события чужих бизнесов
+        if tenant_id and event.get('tenant_id') and str(event.get('tenant_id')) != str(tenant_id):
+            continue
+            
         date_val = event.get('date') or event.get('expected_date')
         direction_val = event.get('direction') or event.get('type')
         amount = event.get('amount', 0)
@@ -82,6 +88,7 @@ def inject_expected_events(base_forecast, forecast_dates, events_list):
         for i, f_date in enumerate(forecast_dates):
             current_date = pd.to_datetime(f_date).date()
             if current_date >= event_date:
+                # Начиная со дня события, баланс изменяется на эту сумму до конца периода
                 for j in range(i, len(adjusted_forecast)):
                     adjusted_forecast[j] += amount_signed
                 break
