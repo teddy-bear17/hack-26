@@ -56,7 +56,7 @@ with tab_forecast:
     st.header("Прогноз остатка на счете")
     
     # ВРЕМЕННАЯ ЗАГЛУШКА: Фейковые данные, чтобы проверить верстку. 
-    # Утром ML-мужик должен заменить это на вызов predict_balance()
+    # Утром заменить это на вызов predict_balance()
     dates = [datetime(2026, 9, 1) + timedelta(days=i) for i in range(60)]
     history = [1500000 + i*5000 for i in range(30)]
     forecast = [1500000 + i*5000 - (i**2)*2000 for i in range(30, 60)]
