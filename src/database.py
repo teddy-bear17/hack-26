@@ -19,14 +19,34 @@ def init_db():
                  
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (username TEXT PRIMARY KEY, password_hash TEXT, role TEXT, company_id TEXT)''')
+                 
+    # НОВАЯ ТАБЛИЦА ДЛЯ СОБЫТИЙ
+    c.execute('''CREATE TABLE IF NOT EXISTS manual_events
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  company_id TEXT,
+                  event_date TEXT,
+                  amount REAL,
+                  direction TEXT,
+                  purpose TEXT,
+                  category_ru TEXT)''')
     
-    c.execute("INSERT OR IGNORE INTO companies VALUES ('C001', 'ООО «Грузоперевозки-063»', '0098524470', NULL)")
-    c.execute("INSERT OR IGNORE INTO companies VALUES ('C002', 'ИП Предприниматель-156', '003844671674', 'C001')")
+    # Авто-импорт компаний, если их мало
+    c.execute("SELECT count(*) FROM companies")
+    if c.fetchone()[0] < 10:
+        for path in ["data/companies.csv", "sample_data/companies.csv"]:
+            if os.path.exists(path):
+                try:
+                    df = pd.read_csv(path, sep=';', dtype={'company_inn': str})
+                    for _, row in df.iterrows():
+                        c.execute("INSERT OR IGNORE INTO companies VALUES (?, ?, ?, NULL)", 
+                                  (row['company_id'], row['company_name'], row['company_inn']))
+                    break
+                except Exception: pass
+
     c.execute("INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?)", ('admin', hash_password('123'), 'Director', 'C001'))
-    
     conn.commit()
     conn.close()
-
+    
 def get_companies():
     conn = sqlite3.connect(DB_NAME)
     df = pd.read_sql_query("SELECT * FROM companies", conn)
@@ -102,3 +122,24 @@ def import_companies_from_csv(df, username):
     conn.commit()
     conn.close()
     return count
+
+def add_manual_event(company_id, event_date, amount, direction, purpose, category):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT INTO manual_events (company_id, event_date, amount, direction, purpose, category_ru) VALUES (?, ?, ?, ?, ?, ?)",
+              (company_id, event_date, amount, direction, purpose, category))
+    conn.commit()
+    conn.close()
+
+def get_manual_events(company_id):
+    conn = sqlite3.connect(DB_NAME)
+    df = pd.read_sql_query(f"SELECT * FROM manual_events WHERE company_id = '{company_id}'", conn)
+    conn.close()
+    return df.to_dict('records')
+
+def delete_manual_event(event_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("DELETE FROM manual_events WHERE id = ?", (event_id,))
+    conn.commit()
+    conn.close()
