@@ -2,15 +2,25 @@ import time
 import random
 from datetime import datetime, timedelta
 
+# --- КАСТОМНЫЕ ИСКЛЮЧЕНИЯ ---
+class IntegrationError(Exception):
+    """Базовая ошибка интеграции."""
+    pass
+
+class TimeoutError(IntegrationError):
+    """Сервер не ответил вовремя."""
+    pass
+
+class AuthError(IntegrationError):
+    """Пользователь не авторизован в системе (протух токен)."""
+    pass
+
 class BankAPI:
     """Имитация внутреннего банковского API (DirectBank / Open API)."""
     
     @staticmethod
     def get_pending_payments(company_inn: str) -> dict:
-        """Возвращает созданные, но еще не исполненные платежные поручения."""
-        # Имитация сетевой задержки
         time.sleep(random.uniform(0.1, 0.3))
-        
         tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
         
         return {
@@ -26,17 +36,19 @@ class ERP1C:
     """Имитация учетной системы (1С:Предприятие / МойСклад)."""
     
     @staticmethod
-    def get_unpaid_invoices(company_inn: str) -> dict:
-        """Возвращает выставленные, но не оплаченные счета."""
-        time.sleep(random.uniform(0.2, 0.5))
+    def get_unpaid_invoices(company_inn: str, token: str = None) -> dict:
+        if not token:
+            raise AuthError("Токен авторизации 1С отсутствует или просрочен.")
+            
+        time.sleep(random.uniform(0.5, 1.0))
         
+        # 20% шанс, что сервер 1С упадет по таймауту
+        if random.random() < 0.2:
+            raise TimeoutError("Превышено время ожидания ответа от 1С (5 сек).")
+            
         in_3_days = (datetime.now() + timedelta(days=3)).strftime('%Y-%m-%d')
         in_7_days = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
         
-        # Шанс "отвала" API для демонстрации отказоустойчивости
-        if random.random() < 0.05:
-            return {"status": "error", "message": "1C Server Timeout 504"}
-            
         return {
             "status": "success",
             "source": "1C ERP",
@@ -51,11 +63,9 @@ class FNSRegistry:
     
     @staticmethod
     def check_counterparties(inn_list: list) -> dict:
-        """Массовая проверка ИНН контрагентов на риски (долги, банкротство)."""
         time.sleep(random.uniform(0.1, 0.4))
         
         results = {}
-        # Захардкоженные ИНН из вашего датасета для демо
         high_risk = {
             '0006094950': {"status": "CRITICAL", "reason": "Находится в стадии банкротства"},
             '0062343230': {"status": "WARNING", "reason": "Задолженность по налогам > 500 тыс. руб."},
