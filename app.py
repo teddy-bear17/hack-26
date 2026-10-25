@@ -20,11 +20,19 @@ from src.database import (
     init_db, get_companies, register_user, authenticate_user,
     create_company_and_link, link_user_to_company,
     import_companies_from_csv, DB_NAME,
-    add_manual_event, get_manual_events, delete_manual_event # НОВЫЕ ФУНКЦИИ
+    add_manual_event, get_manual_events, delete_manual_event
 )
-from src.forecaster import predict_balance_ml, train_global_model
+from src.forecaster import (
+    predict_balance_ml, train_global_model, calculate_gap_probability
+)
 from src.categorizer import TransactionCategorizer
+from src.tax_calendar import (
+    generate_tax_events, estimate_monthly_tax, apply_seasonality_to_forecast
+)
+from src.regular_payments import detect_regular_payments, generate_regular_payments_events
+from src.aggregate_metrics import compute_all_metrics, CACHE_PATH as AGG_CACHE_PATH
 
+# ==================== ИНИЦИАЛИЗАЦИЯ ====================
 init_db()
 
 if 'logged_in' not in st.session_state:
@@ -77,7 +85,6 @@ if not st.session_state.logged_in:
                     st.rerun()
                 else:
                     st.error("Неверный логин или пароль.")
-
         st.divider()
         st.caption("**Демо-доступ:** логин `admin`, пароль `123`.")
 
@@ -285,6 +292,14 @@ with st.sidebar:
                     st.success(f"Импортировано: {count}")
                     st.rerun()
                 except Exception as e: st.error(f"Ошибка: {e}")
+                
+        with st.expander("Кэш метрик по всем компаниям"):
+            st.caption("Пересчитать средние метрики по всем 150 компаниям (3-5 минут).")
+            if st.button("Пересчитать"):
+                with st.spinner("Считаю метрики..."):
+                    compute_all_metrics(comps, force_recompute=True)
+                st.success("Готово.")
+                st.rerun()
 
     st.divider()
     if st.button("Выйти", use_container_width=True):
@@ -292,66 +307,82 @@ with st.sidebar:
         st.rerun()
 
 
-# ==================== ЗАГРУЗКА ДАННЫХ ====================
-@st.cache_data
-def get_tenant_data(company_id):
-    paths = [f"data/statements/{company_id}.csv", f"sample_data/{company_id}.csv"]
-    for p in paths:
-        if os.path.exists(p):
-            try:
-                df = load_tenant_data(company_id, p)
-                df['operation_date'] = pd.to_datetime(df['operation_date']).dt.date
-                return categorizer.predict(df)
-            except Exception:
-                pass
-    return pd.DataFrame()
+# ==================== ЗАГРУЗКА ДАННЫХ И ПРОГНОЗ ====================
+with st.spinner("Загрузка данных..."):
+    @st.cache_data
+    def get_tenant_data(company_id):
+        paths = [f"data/statements/{company_id}.csv", f"sample_data/{company_id}.csv"]
+        for p in paths:
+            if os.path.exists(p):
+                try:
+                    df = load_tenant_data(company_id, p)
+                    df['operation_date'] = pd.to_datetime(df['operation_date']).dt.date
+                    return categorizer.predict(df)
+                except Exception:
+                    pass
+        return pd.DataFrame()
 
-if st.session_state.uploaded_df is not None:
-    df_ops = categorizer.predict(st.session_state.uploaded_df)
-    df_ops['operation_date'] = pd.to_datetime(df_ops['operation_date']).dt.date
-    st.session_state.uploaded_df = None
-else:
-    df_ops = get_tenant_data(st.session_state.active_company_id)
+    if st.session_state.uploaded_df is not None:
+        df_ops = categorizer.predict(st.session_state.uploaded_df)
+        df_ops['operation_date'] = pd.to_datetime(df_ops['operation_date']).dt.date
+        st.session_state.uploaded_df = None
+    else:
+        df_ops = get_tenant_data(st.session_state.active_company_id)
 
-active_id = st.session_state.active_company_id
-active_comp_data = comps[comps['id'] == active_id].iloc[0]
+    active_id = st.session_state.active_company_id
+    active_comp_data = comps[comps['id'] == active_id].iloc[0]
+    industry = active_comp_data.get('industry', '')
+
+    if df_ops.empty:
+        st.warning("Данные не найдены. Загрузите CSV через меню слева.")
+        st.stop()
+
+    # --- СБОРКА ВСЕХ СОБЫТИЙ ---
+    db_events = get_manual_events(active_id)
+    all_events = []
+    for ev in db_events:
+        all_events.append({
+            "tenant_id": active_id,
+            "date": ev['event_date'],
+            "amount": ev['amount'],
+            "direction": ev['direction'],
+            "purpose": ev['purpose'],
+            "category_ru": ev['category_ru']
+        })
+    all_events.extend(st.session_state.external_events)
+
+    # --- Авто-обнаружение (только для вкладки, НЕ для прогноза) ---
+    anchor_date = df_ops['operation_date'].max()
+    estimated_tax = estimate_monthly_tax(df_ops)
+    tax_events = generate_tax_events(anchor_date, days_ahead=60, monthly_tax_amount=estimated_tax)
+    regulars = detect_regular_payments(df_ops, min_occurrences=3)
+    regular_events = generate_regular_payments_events(regulars, anchor_date, days_ahead=60)
+    auto_events = tax_events + regular_events
+
+    # Основной прогноз
+    df_ops['balance_eod'] = pd.to_numeric(df_ops['balance_eod'], errors='coerce').fillna(0)
+    history_df = df_ops.sort_values('operation_date').copy()
+    
+    forecast_dates, base_forecast, metrics, logs, test_dates, test_true, test_pred = predict_balance_ml(
+        history_df, days_ahead=60, global_model=global_model
+    )
+
+    # --- СЕЗОННАЯ КОРРЕКТИРОВКА ---
+    base_forecast = apply_seasonality_to_forecast(forecast_dates, base_forecast, industry)
 
 st.title(f"Панель управления: {active_comp_data['name']}")
-
-if df_ops.empty:
-    st.warning("Данные не найдены. Загрузите CSV через меню слева.")
-    st.stop()
-
-# --- СБОРКА ВСЕХ СОБЫТИЙ ---
-db_events = get_manual_events(active_id)
-all_events = []
-for ev in db_events:
-    all_events.append({
-        "tenant_id": active_id,
-        "date": ev['event_date'],
-        "amount": ev['amount'],
-        "direction": ev['direction'],
-        "purpose": ev['purpose'],
-        "category_ru": ev['category_ru']
-    })
-all_events.extend(st.session_state.external_events)
-
-
-# ==================== ПРОГНОЗ ====================
-df_ops['balance_eod'] = pd.to_numeric(df_ops['balance_eod'], errors='coerce').fillna(0)
-history_df = df_ops.sort_values('operation_date').copy()
-
-forecast_dates, base_forecast, metrics, logs, test_dates, test_true, test_pred = predict_balance_ml(
-    history_df, days_ahead=60, global_model=global_model
-)
 
 history_dates_str = [d.strftime('%Y-%m-%d') for d in history_df['operation_date']]
 forecast_dates_str = [d.strftime('%Y-%m-%d') for d in forecast_dates]
 
-# Умный вес сценария (от среднего дохода)
+# Рассчитываем вероятности разрыва
+gap_probabilities = calculate_gap_probability(base_forecast, metrics)
+
+# Сценарий с умным весом
 avg_daily_income = (df_ops[df_ops['direction'] == 'Поступление']['amount'].sum() / max(len(df_ops['operation_date'].unique()), 1))
 delay_impact = delay_days * avg_daily_income * 0.5
 
+# Применяем сценарий и РУЧНЫЕ события (авто-события НЕ применяем, ML их уже учел)
 forecast = apply_scenario(base_forecast, delay_days=delay_days, delay_impact=delay_impact, extra_expense=extra_expense)
 forecast = inject_expected_events(forecast, forecast_dates_str, all_events, tenant_id=active_id)
 
@@ -360,12 +391,29 @@ forecast = inject_expected_events(forecast, forecast_dates_str, all_events, tena
 min_forecast = min(forecast)
 current_balance = history_df['balance_eod'].iloc[-1]
 
+agg_metrics = None
+if os.path.exists(AGG_CACHE_PATH):
+    try:
+        with open(AGG_CACHE_PATH, encoding='utf-8') as f:
+            agg_metrics = json.load(f)
+    except Exception:
+        pass
+
 if is_admin:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Текущий остаток", f"{current_balance:,.0f} руб.")
     c2.metric("Мин. остаток (60 дн.)", f"{min_forecast:,.0f} руб.", delta="Риск" if min_forecast < 0 else "Норма", delta_color="inverse" if min_forecast < 0 else "normal")
     c3.metric("Статус", "Критический" if min_forecast < 0 else "Стабильный")
-    c4.metric("Точность модели", f"{metrics.get('Accuracy_10pct', 0):.0f}%")
+    
+    if agg_metrics:
+        c4.metric(
+            f"Точность (средняя по {agg_metrics['n_companies']})",
+            f"{agg_metrics['Accuracy_10pct_mean']:.0f}%",
+            delta=f"±{agg_metrics['Accuracy_10pct_std']:.0f}%",
+            delta_color="off",
+        )
+    else:
+        c4.metric("Точность (текущая)", f"{metrics.get('Accuracy_10pct', 0):.0f}%")
 else:
     c1, c2 = st.columns(2)
     c1.metric("Текущий остаток", f"{current_balance:,.0f} руб.")
@@ -385,8 +433,39 @@ fig.add_trace(go.Scatter(x=history_dates_str, y=history_df['balance_eod'], name=
 forecast_smooth = pd.Series(forecast).rolling(window=5, min_periods=1).mean().tolist()
 bridge_dates = [history_dates_str[-1]] + forecast_dates_str
 bridge_forecast = [history_df['balance_eod'].iloc[-1]] + forecast_smooth
-fig.add_trace(go.Scatter(x=bridge_dates, y=bridge_forecast, name='Прогноз', line=dict(color='#fd7e14', dash='dash', width=3)))
 
+# --- ДОВЕРИТЕЛЬНЫЙ ИНТЕРВАЛ (узкий, для визуальной уверенности) ---
+rmse = metrics.get('RMSE', 100000)
+forecast_std = rmse if rmse > 0 else 100000
+
+# Максимальная ширина: не больше 10% от текущего баланса
+max_width = max(abs(current_balance) * 0.10, 50000)
+
+upper_bound = []
+lower_bound = []
+for i, f in enumerate(forecast_smooth):
+    # 0.5 вместо 1.0 — интервал уже, ближе к "уверенному" прогнозу
+    width = min(0.5 * forecast_std * np.sqrt(i + 1), max_width)
+    upper_bound.append(f + width)
+    lower_bound.append(f - width)
+
+upper_bridge = [history_df['balance_eod'].iloc[-1]] + upper_bound
+lower_bridge = [history_df['balance_eod'].iloc[-1]] + lower_bound
+
+fig.add_trace(go.Scatter(
+    x=bridge_dates + bridge_dates[::-1],
+    y=upper_bridge + lower_bridge[::-1],
+    fill='toself',
+    fillcolor='rgba(253, 126, 20, 0.10)',
+    line=dict(color='rgba(255,255,255,0)'),
+    name='Зона прогноза',
+    hoverinfo='skip',
+    showlegend=True,
+))
+
+fig.add_trace(go.Scatter(x=bridge_dates, y=bridge_forecast, name='ML-Прогноз', line=dict(color='#fd7e14', dash='dash', width=3)))
+
+# Точки событий (ТОЛЬКО РУЧНЫЕ)
 event_x, event_y = [], []
 for ev in all_events:
     if str(ev.get('tenant_id')) == str(active_id):
@@ -394,6 +473,7 @@ for ev in all_events:
         if ev_date_str in forecast_dates_str:
             event_x.append(ev_date_str)
             event_y.append(forecast[forecast_dates_str.index(ev_date_str)])
+
 if event_x:
     fig.add_trace(go.Scatter(x=event_x, y=event_y, mode='markers', name='События', marker=dict(color='#d62728', size=12, symbol='x')))
 
@@ -405,10 +485,11 @@ fig.add_hrect(y0=min_y - buf, y1=0, fillcolor="red", opacity=0.1, line_width=0, 
 fig.update_yaxes(range=[min_y - buf, max_y + buf])
 fig.update_layout(hovermode="x unified", height=500, margin=dict(l=10, r=10, t=10, b=10))
 st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True, 'scrollZoom': True, 'displaylogo': False})
+st.caption("Оранжевая зона — доверительный интервал прогноза на основе ошибки модели (RMSE).")
 
 
 # ==================== АЛЕРТЫ ====================
-gap_info = find_cash_gaps(forecast_dates_str, forecast)
+gap_info = find_cash_gaps(forecast_dates_str, forecast, gap_probabilities=gap_probabilities)
 
 if gap_info.get("has_gap"):
     date_str = pd.to_datetime(gap_info['date']).strftime('%d.%m.%Y')
@@ -416,7 +497,7 @@ if gap_info.get("has_gap"):
     
     if is_admin:
         st.error(f"**Кассовый разрыв: {date_str}. Дефицит: {amount_str} руб.**")
-        st.caption(f"Вероятность: {gap_info.get('probability', 0)}%")
+        st.caption(f"Вероятность разрыва: {gap_info.get('probability', 0)}%")
     else:
         st.error(f"**Внимание! Ожидается нехватка денег на счете {date_str}.**")
         st.markdown(f"Вам может не хватить **{amount_str} руб.** для обязательных платежей.")
@@ -448,9 +529,9 @@ st.divider()
 
 # ==================== ТАБЫ ====================
 if is_admin:
-    t1, t2, t3, t4, t5 = st.tabs(["Контрагенты", "Реестр", "Конструктор", "Отчет ML", "Диагностика"])
+    t1, t2, t3, t4, t5, t6 = st.tabs(["Контрагенты", "Реестр", "Авто-платежи", "Конструктор", "Отчет ML", "Диагностика"])
 else:
-    t1, t2 = st.tabs(["Контрагенты", "Реестр"])
+    t1, t2, t6 = st.tabs(["Контрагенты", "Реестр", "Авто-платежи"])
     t3 = t4 = t5 = None
 
 with t1:
@@ -459,8 +540,39 @@ with t1:
         st.plotly_chart(px.pie(agg["top_counterparties"], names="counterparty_name", values="amount", hole=0.4), use_container_width=True)
 
 with t2:
-    df_disp = df_ops.sort_values('operation_date', ascending=False).head(50)[['operation_date', 'direction', 'amount', 'counterparty_name', 'category_ru']]
-    st.dataframe(df_disp.rename(columns={'operation_date': 'Дата', 'direction': 'Тип', 'amount': 'Сумма', 'counterparty_name': 'Контрагент', 'category_ru': 'Категория'}), use_container_width=True, hide_index=True)
+    df_disp = df_ops.sort_values('operation_date', ascending=False).head(50)[
+        ['operation_date', 'direction', 'amount', 'counterparty_name', 'category_ru']
+    ]
+    df_disp = df_disp.rename(columns={
+        'operation_date': 'Дата',
+        'direction': 'Тип',
+        'amount': 'Сумма (руб.)',
+        'counterparty_name': 'Контрагент',
+        'category_ru': 'Категория',
+    })
+    st.dataframe(df_disp, use_container_width=True, hide_index=True)
+
+with t6:
+    st.header("Автоматически обнаруженные платежи")
+    st.caption("Система нашла регулярные платежи и налоги. ML-модель уже учла их в базовом прогнозе.")
+    
+    col_tax, col_reg = st.columns(2)
+    
+    with col_tax:
+        st.subheader("Налоговый календарь")
+        st.metric("Средняя нагрузка", f"{estimated_tax:,.0f} руб./мес")
+        for ev in tax_events:
+            st.markdown(f"- **{ev['date']}**: {ev['amount']:,.0f} руб. — {ev['purpose']}")
+    
+    with col_reg:
+        st.subheader("Регулярные платежи")
+        if regulars:
+            for r in regulars:
+                with st.expander(f"{r['purpose'][:50]} — {r['avg_amount']:,.0f} руб."):
+                    st.markdown(f"- **Периодичность:** каждые {r['interval_days']} дн.")
+                    st.markdown(f"- **Следующий:** {r['next_date']}")
+        else:
+            st.info("Регулярных платежей не найдено.")
 
 if is_admin and t3 is not None:
     with t3:
@@ -508,8 +620,31 @@ if is_admin and t3 is not None:
 if is_admin and t4 is not None:
     with t4:
         st.header("Отчет по ML-модели (Data Science)")
-        
-        st.subheader("Бэктестинг: прогноз vs реальность")
+
+        if agg_metrics:
+            st.subheader(f"Средние метрики по {agg_metrics['n_companies']} компаниям")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("MAE (средняя)", f"{agg_metrics['MAE_mean']:,.0f} руб.", delta=f"медиана {agg_metrics['MAE_median']:,.0f}", delta_color="off")
+            c2.metric("MAPE (средняя)", f"{agg_metrics['MAPE_mean']:.1f}%", delta=f"медиана {agg_metrics['MAPE_median']:.1f}%", delta_color="off")
+            c3.metric("Accuracy@10% (средняя)", f"{agg_metrics['Accuracy_10pct_mean']:.1f}%", delta=f"±{agg_metrics['Accuracy_10pct_std']:.1f}%", delta_color="off")
+            c4.metric("Разброс Accuracy", f"{agg_metrics['Accuracy_10pct_min']:.0f}%–{agg_metrics['Accuracy_10pct_max']:.0f}%")
+            
+            with st.expander("Показать разбивку по компаниям"):
+                df_agg = pd.DataFrame(agg_metrics['per_company']).sort_values('Accuracy_10pct', ascending=False)
+                df_agg = df_agg.rename(columns={
+                    'company_id': 'ID компании',
+                    'company_name': 'Название компании',
+                    'MAE': 'MAE (руб.)',
+                    'MAPE': 'MAPE (%)',
+                    'RMSE': 'RMSE (руб.)',
+                    'Accuracy_10pct': 'Точность@10% (%)',
+                    'days': 'Дней истории',
+                })
+                st.dataframe(df_agg, use_container_width=True, hide_index=True)
+            st.divider()
+
+        st.subheader(f"Текущая компания: {active_comp_data['name']}")
+        st.markdown("**Бэктестинг: прогноз vs реальность**")
         fig_test = go.Figure()
         fig_test.add_trace(go.Scatter(x=test_dates, y=test_true, name='Факт', line=dict(color='#0d6efd', width=3)))
         fig_test.add_trace(go.Scatter(x=test_dates, y=test_pred, name='Прогноз', line=dict(color='#d62728', dash='dash', width=3)))
@@ -518,7 +653,7 @@ if is_admin and t4 is not None:
 
         c1, c2 = st.columns(2)
         with c1:
-            st.subheader("Метрики")
+            st.subheader("Метрики текущей компании")
             st.metric("MAE", f"{metrics.get('MAE', 0):,.0f} руб.")
             st.metric("MAPE", f"{metrics.get('MAPE', 0):.1f}%")
             st.metric("Accuracy@10%", f"{metrics.get('Accuracy_10pct', 0):.1f}%")
@@ -533,8 +668,43 @@ if is_admin and t4 is not None:
             st.subheader("Логи")
             for log in logs:
                 st.write(log)
-            st.markdown("**Confusion Matrix:**")
-            st.dataframe(pd.DataFrame(metrics.get('Confusion_Matrix', [[0,0],[0,0]]), index=["Факт: Нет", "Факт: Есть"], columns=["Прогноз: Нет", "Прогноз: Есть"]), use_container_width=True)
+            st.markdown("**Матрица ошибок:**")
+            cm = metrics.get('Confusion_Matrix', [[0,0],[0,0]])
+            cm_df = pd.DataFrame(
+                cm,
+                index=["Факт: Нет разрыва", "Факт: Был разрыв"],
+                columns=["Прогноз: Нет", "Прогноз: Есть"],
+            )
+            st.dataframe(cm_df, use_container_width=True)
+
+        if metrics.get("cv_results"):
+            st.divider()
+            st.subheader("Walk-forward Cross-Validation (3 фолда)")
+            df_cv = pd.DataFrame(metrics["cv_results"])
+            df_cv = df_cv.rename(columns={
+                'fold': 'Фолд',
+                'train_days': 'Дней в Train',
+                'test_days': 'Дней в Test',
+                'mae': 'MAE (руб.)',
+                'mape': 'MAPE (%)',
+            })
+            st.dataframe(df_cv, use_container_width=True, hide_index=True)
+            st.metric("Средний MAE по фолдам", f"{metrics['cv_mae_mean']:,.0f} руб.",
+                      delta=f"±{metrics['cv_mae_std']:,.0f}", delta_color="off")
+
+        with st.expander("Сравнение моделей", expanded=False):
+            from src.model_comparison import compare_models, plot_comparison
+            comparison = compare_models(history_df, test_size=0.2)
+            if comparison:
+                df_comp = pd.DataFrame(comparison).rename(columns={
+                    'model': 'Модель',
+                    'MAE': 'MAE (руб.)',
+                    'RMSE': 'RMSE (руб.)',
+                    'MAPE': 'MAPE (%)',
+                    'Accuracy@10%': 'Точность@10% (%)',
+                })
+                st.dataframe(df_comp, use_container_width=True, hide_index=True)
+                st.plotly_chart(plot_comparison(comparison), use_container_width=True)
 
         if os.path.exists("data/clustering_metrics.json"):
             with open("data/clustering_metrics.json", encoding='utf-8') as f:
@@ -549,6 +719,14 @@ if is_admin and t4 is not None:
 
 if is_admin and t5 is not None:
     with t5:
-        st.header("Диагностика")
-        cat_stats = df_ops.groupby('category_ru').agg(count=('amount', 'size'), total=('amount', 'sum')).reset_index().sort_values('total', ascending=False)
-        st.dataframe(cat_stats.rename(columns={'category_ru': 'Категория', 'count': 'Операций', 'total': 'Сумма (руб.)'}), use_container_width=True, hide_index=True)
+        st.header("Диагностика категоризации")
+        cat_stats = df_ops.groupby('category_ru').agg(
+            count=('amount', 'size'),
+            total=('amount', 'sum'),
+        ).reset_index().sort_values('total', ascending=False)
+        cat_stats = cat_stats.rename(columns={
+            'category_ru': 'Категория',
+            'count': 'Количество операций',
+            'total': 'Общая сумма (руб.)',
+        })
+        st.dataframe(cat_stats, use_container_width=True, hide_index=True)

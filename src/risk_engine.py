@@ -2,27 +2,45 @@ import pandas as pd
 from datetime import timedelta
 from src.mock_integrations import FNSRegistry
 
-def find_cash_gaps(forecast_dates, forecast_balances, ml_lower_bounds=None):
-    if not forecast_dates: return {"has_gap": False}
+
+def find_cash_gaps(forecast_dates, forecast_balances, gap_probabilities=None):
+    """
+    Ищет кассовые разрывы.
+    Если переданы вероятности — использует их вместо эвристики.
+    """
+    if not forecast_dates:
+        return {"has_gap": False}
+
     start_date = pd.to_datetime(forecast_dates[0]).date()
+
     for i, balance in enumerate(forecast_balances):
-        is_gap = balance < 0
-        if ml_lower_bounds is not None and len(ml_lower_bounds) > i:
-            if ml_lower_bounds[i] < 0: is_gap = True 
-        if is_gap:
+        if balance < 0:
             gap_date = pd.to_datetime(forecast_dates[i]).date()
             days_to_gap = (gap_date - start_date).days
-            probability = max(50, 95 - int(days_to_gap * 1.5))
-            if balance < 0: probability = min(99, probability + 15)
+
+            # Если есть реальная вероятность от модели — используем её
+            if gap_probabilities is not None and i < len(gap_probabilities):
+                probability = int(gap_probabilities[i] * 100)
+            else:
+                # Fallback: старая эвристика
+                probability = max(50, 95 - int(days_to_gap * 1.5))
+                probability = min(99, probability + 15)
+
             return {
-                "has_gap": True, "date": gap_date,
-                "deficit": abs(balance if balance < 0 else ml_lower_bounds[i]),
-                "probability": probability, "is_tax_day": gap_date.day == 28, "index": i
+                "has_gap": True,
+                "date": gap_date,
+                "deficit": abs(balance),
+                "probability": probability,
+                "is_tax_day": gap_date.day == 28,
+                "index": i,
             }
+
     return {"has_gap": False}
+
 
 def apply_scenario(base_forecast, delay_days=0, delay_impact=0, extra_expense=0, preset=None):
     if preset == "client_lost": delay_days, delay_impact, extra_expense = 0, 0, 500000
+    
     scenario_forecast = []
     for i, val in enumerate(base_forecast):
         new_val = val
@@ -32,32 +50,43 @@ def apply_scenario(base_forecast, delay_days=0, delay_impact=0, extra_expense=0,
         scenario_forecast.append(new_val)
     return scenario_forecast
 
+
 def inject_expected_events(base_forecast, forecast_dates, events_list, tenant_id=None):
     if not events_list: return base_forecast
     adjusted_forecast = list(base_forecast)
+    
     for event in events_list:
-        if tenant_id and event.get('tenant_id') and str(event.get('tenant_id')) != str(tenant_id): continue
+        if tenant_id and event.get('tenant_id') and str(event.get('tenant_id')) != str(tenant_id):
+            continue
+            
         date_val = event.get('date') or event.get('expected_date')
         direction_val = event.get('direction') or event.get('type')
         amount = event.get('amount', 0)
+        
         if not date_val or not direction_val: continue
+        
         event_date = pd.to_datetime(date_val).date()
         is_income = direction_val.lower() == 'поступление'
         amount_signed = amount if is_income else -amount
+        
         for i, f_date in enumerate(forecast_dates):
             if pd.to_datetime(f_date).date() >= event_date:
                 for j in range(i, len(adjusted_forecast)):
                     adjusted_forecast[j] += amount_signed
                 break
+                
     return adjusted_forecast
+
 
 def check_counterparty_risk(inn_list):
     if not inn_list: return {}
     response = FNSRegistry.check_counterparties(inn_list)
     return response.get("data", {}) if response.get("status") == "success" else {}
 
+
 def aggregate_ui_data(df):
     if df.empty: return {"top_counterparties": pd.DataFrame(), "category_distribution": pd.DataFrame()}
+    
     df_expenses = df[df['direction'] == 'Списание'].copy()
     
     if 'counterparty_name' in df_expenses.columns:
@@ -70,12 +99,16 @@ def aggregate_ui_data(df):
         cat_dist = df_expenses.groupby(group_col)['amount'].sum().reset_index().sort_values('amount', ascending=False).head(7)
     else:
         cat_dist = pd.DataFrame(columns=[group_col, 'amount'])
+        
     return {"top_counterparties": top_cp, "category_distribution": cat_dist}
+
 
 def explain_cash_gap(forecast_operations_df, gap_date):
     if forecast_operations_df is None or forecast_operations_df.empty: return []
+    
     df_safe = forecast_operations_df.copy()
     if 'category_ru' not in df_safe.columns: df_safe['category_ru'] = 'Прочее'
+    
     df_safe['operation_date'] = pd.to_datetime(df_safe['operation_date']).dt.date
     df_safe['day_of_month'] = pd.to_datetime(df_safe['operation_date']).dt.day
     
@@ -89,6 +122,7 @@ def explain_cash_gap(forecast_operations_df, gap_date):
         past_expenses = df_safe[mask_30].copy()
         
     if past_expenses.empty: return []
+    
     top_reasons = past_expenses.groupby('category_ru')['amount'].mean().reset_index().sort_values(by='amount', ascending=False).head(3)
     return top_reasons.to_dict('records')
 

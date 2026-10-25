@@ -1,34 +1,29 @@
-# --- Python ---
 __pycache__/
 *.py[cod]
 *.so
 
-# --- Virtual Environments ---
 venv/
 env/
 .venv/
 
-# --- IDE / OS ---
 .vscode/
 .idea/
 *.swp
 .DS_Store
 
-# --- Streamlit secrets ---
 .streamlit/secrets.toml
 
-# --- Database ---
 *.db
 *.sqlite
 *.sqlite3
 data/app.db
 
-# --- Тяжелые данные (НЕ кидаем в гит) ---
 data/all_operations.csv
 data/statements/*.csv
 
-# --- Временный мусор ---
 *.log
 *.tmp
 *.bak
 .cache/
+
+catboost_info/
